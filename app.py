@@ -1,123 +1,110 @@
 """
-app.py
+FitFindr — Gradio chat UI.
 
-Gradio interface for FitFindr. The layout and wiring are already set up —
-your job is to fill in handle_query() so it calls run_agent() and maps
-the session results to the three output panels.
+A simple web front-end over the Agent planning loop. Each browser session gets
+its own Agent (its own state), so the wardrobe and conversation persist across
+turns within a session.
 
-Run with:
+Run:
     python app.py
-
-Then open the localhost URL shown in your terminal (usually http://localhost:7860,
-but check your terminal — the port may differ).
+then open the printed local URL.
 """
 
+from __future__ import annotations
+
+import os
+
 import gradio as gr
+from dotenv import load_dotenv
 
-from agent import run_agent
-from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
+from agent import Agent
+from utils.data_loader import get_example_wardrobe
 
-
-# ── query handler ─────────────────────────────────────────────────────────────
-
-def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
-    """
-    Called by Gradio when the user submits a query.
-
-    Args:
-        user_query:     The text the user typed into the search box.
-        wardrobe_choice: Either "Example wardrobe" or "Empty wardrobe (new user)".
-
-    Returns:
-        A tuple of three strings:
-            (listing_text, outfit_suggestion, fit_card)
-        Each string maps to one of the three output panels in the UI.
-
-    TODO:
-        1. Guard against an empty query (return early with an error message).
-        2. Select the wardrobe based on wardrobe_choice.
-        3. Call run_agent() with the query and selected wardrobe.
-        4. If session["error"] is set, return the error in the first panel
-           and empty strings for the other two.
-        5. Otherwise, format session["selected_item"] into a readable listing_text
-           string and return it along with session["outfit_suggestion"] and
-           session["fit_card"].
-    """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+load_dotenv()
 
 
-# ── interface ─────────────────────────────────────────────────────────────────
-
-EXAMPLE_QUERIES = [
-    "vintage graphic tee under $30",
-    "90s track jacket in size M",
-    "flowy midi skirt under $40",
-    "black combat boots size 8",
-    "designer ballgown size XXS under $5",   # deliberate no-results test
+EXAMPLES = [
+    "I'm looking for a vintage graphic tee under $30. I wear baggy jeans and chunky sneakers. What's out there and how would I style it?",
+    "Find me cozy cottagecore knitwear under $40 and style it.",
+    "I want some y2k platform shoes. How would I wear them?",
+    "Show me a denim jacket under $45 and build an outfit around it.",
 ]
 
-def build_interface():
-    with gr.Blocks(title="FitFindr") as demo:
-        gr.Markdown("""
-# FitFindr 🛍️
-Find secondhand pieces and get outfit ideas based on your wardrobe.
-Describe what you're looking for — include size and price if you want to filter.
-        """)
+
+def _wardrobe_markdown(wardrobe: dict) -> str:
+    items = wardrobe.get("items", []) if isinstance(wardrobe, dict) else []
+    if not items:
+        return "_Your wardrobe is empty._"
+    lines = ["**Your wardrobe (used for styling):**"]
+    for it in items:
+        lines.append(f"- {it.get('name', 'item')} ({it.get('category', '?')})")
+    return "\n".join(lines)
+
+
+def respond(message: str, history: list, state: dict):
+    """Gradio chat handler. `state` carries the per-session Agent."""
+    agent: Agent = state.get("agent")
+    if agent is None:
+        agent = Agent(wardrobe=get_example_wardrobe())
+        state["agent"] = agent
+
+    if not message or not message.strip():
+        return history, state, ""
+
+    history = history + [{"role": "user", "content": message}]
+    try:
+        reply = agent.chat(message)
+    except RuntimeError as e:
+        # Most likely a missing GROQ_API_KEY.
+        reply = f"Configuration error: {e}"
+    except Exception as e:  # noqa: BLE001 - surface any runtime error to the UI
+        reply = f"Something went wrong: {e}"
+
+    history = history + [{"role": "assistant", "content": reply}]
+    return history, state, ""
+
+
+def build_ui() -> gr.Blocks:
+    with gr.Blocks(title="FitFindr", theme=gr.themes.Soft()) as demo:
+        gr.Markdown(
+            "# FitFindr\n"
+            "Tell me what secondhand piece you're after and how you dress — "
+            "I'll find a listing, style it with your closet, and make a fit card."
+        )
+
+        session = gr.State({"agent": None})
 
         with gr.Row():
-            query_input = gr.Textbox(
-                label="What are you looking for?",
-                placeholder="e.g. vintage graphic tee under $30, size M",
-                lines=2,
-                scale=3,
-            )
-            wardrobe_choice = gr.Radio(
-                choices=["Example wardrobe", "Empty wardrobe (new user)"],
-                value="Example wardrobe",
-                label="Wardrobe",
-                scale=1,
+            with gr.Column(scale=3):
+                chatbot = gr.Chatbot(type="messages", height=460, label="FitFindr")
+                msg = gr.Textbox(
+                    placeholder="e.g. vintage graphic tee under $30, I wear baggy jeans...",
+                    label="Your request",
+                    autofocus=True,
+                )
+                with gr.Row():
+                    send = gr.Button("Send", variant="primary")
+                    clear = gr.Button("Reset session")
+                gr.Examples(examples=EXAMPLES, inputs=msg, label="Try one")
+            with gr.Column(scale=1):
+                gr.Markdown(_wardrobe_markdown(get_example_wardrobe()))
+
+        if not os.getenv("GROQ_API_KEY"):
+            gr.Markdown(
+                "> **Heads up:** `GROQ_API_KEY` isn't set. Add it to a `.env` file "
+                "to enable the assistant. Get a free key at console.groq.com."
             )
 
-        submit_btn = gr.Button("Find it", variant="primary")
+        send.click(respond, [msg, chatbot, session], [chatbot, session, msg])
+        msg.submit(respond, [msg, chatbot, session], [chatbot, session, msg])
 
-        with gr.Row():
-            listing_output = gr.Textbox(
-                label="🛍️ Top listing found",
-                lines=8,
-                interactive=False,
-            )
-            outfit_output = gr.Textbox(
-                label="👗 Outfit idea",
-                lines=8,
-                interactive=False,
-            )
-            fitcard_output = gr.Textbox(
-                label="✨ Your fit card",
-                lines=8,
-                interactive=False,
-            )
+        def _reset():
+            return [], {"agent": None}, ""
 
-        gr.Examples(
-            examples=[[q, "Example wardrobe"] for q in EXAMPLE_QUERIES],
-            inputs=[query_input, wardrobe_choice],
-            label="Try these queries",
-        )
-
-        submit_btn.click(
-            fn=handle_query,
-            inputs=[query_input, wardrobe_choice],
-            outputs=[listing_output, outfit_output, fitcard_output],
-        )
-        query_input.submit(
-            fn=handle_query,
-            inputs=[query_input, wardrobe_choice],
-            outputs=[listing_output, outfit_output, fitcard_output],
-        )
+        clear.click(_reset, outputs=[chatbot, session, msg])
 
     return demo
 
 
 if __name__ == "__main__":
-    demo = build_interface()
-    demo.launch()
+    build_ui().launch()
